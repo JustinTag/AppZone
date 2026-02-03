@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -7,22 +8,92 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.ServiceProcess;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 
 namespace AppZone
 {
+    internal static class AuditLog
+    {
+        private const string EventSourceName = "AppZone";
+        private const string EventLogName = "Application";
+        private static readonly object LogLock = new object();
+        private static bool? sourceReady;
+
+        public static void Error(string message, Exception ex)
+        {
+            if (ex != null)
+            {
+                message = $"{message}{Environment.NewLine}{ex}";
+            }
+
+            WriteEntry(message, EventLogEntryType.Error);
+        }
+
+        public static void Warning(string message)
+        {
+            WriteEntry(message, EventLogEntryType.Warning);
+        }
+
+        public static void Info(string message)
+        {
+            WriteEntry(message, EventLogEntryType.Information);
+        }
+
+        private static void WriteEntry(string message, EventLogEntryType entryType)
+        {
+            try
+            {
+                lock (LogLock)
+                {
+                    if (!sourceReady.HasValue)
+                    {
+                        try
+                        {
+                            if (!EventLog.SourceExists(EventSourceName))
+                            {
+                                EventLog.CreateEventSource(EventSourceName, EventLogName);
+                            }
+                            sourceReady = true;
+                        }
+                        catch (Exception)
+                        {
+                            sourceReady = false;
+                            Trace.WriteLine($"{DateTimeOffset.UtcNow:o} {entryType}: {message}");
+                            return;
+                        }
+                    }
+                    else if (sourceReady == false)
+                    {
+                        Trace.WriteLine($"{DateTimeOffset.UtcNow:o} {entryType}: {message}");
+                        return;
+                    }
+
+                    string entry = message ?? string.Empty;
+                    if (entry.Length > 32000)
+                    {
+                        entry = entry.Substring(0, 32000);
+                    }
+
+                    EventLog.WriteEntry(EventSourceName, entry, entryType);
+                }
+            }
+            catch (Exception)
+            {
+                Trace.WriteLine($"{DateTimeOffset.UtcNow:o} {entryType}: {message}");
+            }
+        }
+    }
+
     public partial class AppZone : ServiceBase
     {
         private static readonly TimeSpan TimerInterval = TimeSpan.FromMinutes(1);
         private static Timer timer;
         private static int timerRunning = 0;
         private static volatile bool stopping = false;
-        private const string EventSourceName = "AppZone";
-        private const string EventLogName = "Application";
 
-        private static readonly string[] MonitoredApplications =
+        private static readonly string[] DotaApplications =
         {
             "steam.exe",
             "dota.exe",
@@ -32,10 +103,46 @@ namespace AppZone
             "dota2"
         };
 
-        private static readonly string[] MonitoredProcessNames = MonitoredApplications
+        private static readonly string[] TradingApplications =
+        {
+            "terminal",
+            "terminal.exe",
+            "terminal64",
+            "terminal64.exe",
+            "metaeditor",
+            "metaeditor.exe",
+            "metatrader",
+            "metatrader.exe"
+        };
+
+        private static readonly string[] MetaTraderDescriptionGateApplications =
+        {
+            "terminal",
+            "terminal.exe",
+            "terminal64",
+            "terminal64.exe"
+        };
+
+        private static readonly string[] DotaProcessNames = DotaApplications
             .Select(NormalizeProcessName)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
+
+        private static readonly string[] TradingProcessNames = TradingApplications
+            .Select(NormalizeProcessName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        private static readonly HashSet<string> MetaTraderDescriptionGateProcessNames = new HashSet<string>(
+            MetaTraderDescriptionGateApplications.Select(NormalizeProcessName)
+                .Distinct(StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase);
+
+        private static readonly TimeSpan KillFailureLogThrottle = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan KillFailureLogTtl = TimeSpan.FromHours(6);
+        private const int KillFailureLogMaxEntries = 500;
+        private static readonly object KillLogLock = new object();
+        private static readonly Dictionary<string, DateTimeOffset> lastKillFailureLogUtc = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
 
         private const bool FailClosedWhenTimeUnavailable = true;
 
@@ -128,56 +235,35 @@ namespace AppZone
 
         private static async Task EnforcePolicyAsync()
         {
-            bool shouldBlock = false;
+            bool shouldBlockDota = false;
+            bool shouldBlockTrading = false;
 
             DateTimeOffset? utcNow = await OnlineTimeProvider.GetUtcNowAsync().ConfigureAwait(false);
             if (utcNow.HasValue)
             {
-                shouldBlock = ShouldBlockForUtcTime(utcNow.Value);
+                DateTimeOffset localNow = OnlineTimeProvider.ConvertUtcToPhilippinesTime(utcNow.Value);
+                shouldBlockDota = ShouldBlockDotaForLocalTime(localNow);
+                shouldBlockTrading = ShouldBlockTradingForLocalTime(localNow);
             }
             else if (FailClosedWhenTimeUnavailable)
             {
-                shouldBlock = true;
+                shouldBlockDota = true;
+                shouldBlockTrading = true;
             }
 
-            if (!shouldBlock)
+            if (shouldBlockDota)
             {
-                return;
+                KillProcesses(DotaProcessNames, null);
             }
 
-            foreach (string processName in MonitoredProcessNames)
+            if (shouldBlockTrading)
             {
-                Process[] processes;
-                try
-                {
-                    processes = Process.GetProcessesByName(processName);
-                }
-                catch (Exception ex)
-                {
-                    LogError($"Failed to enumerate processes for {processName}.", ex);
-                    continue;
-                }
-
-                foreach (Process process in processes)
-                {
-                    using (process)
-                    {
-                        try { process.CloseMainWindow(); } catch (Exception) { }
-                        try { process.Kill(); } catch (Exception) { }
-                    }
-                }
+                KillProcesses(TradingProcessNames, ShouldKillTradingProcess);
             }
         }
 
-        private static bool ShouldBlockForUtcTime(DateTimeOffset utcNow)
+        private static bool ShouldBlockDotaForLocalTime(DateTimeOffset localNow)
         {
-            DateTimeOffset localNow = OnlineTimeProvider.ConvertUtcToPhilippinesTime(utcNow);
-
-            if (localNow <= new DateTimeOffset(2024, 2, 24, 0, 0, 0, TimeSpan.FromHours(8)))
-            {
-                return false;
-            }
-
             DayOfWeek day = localNow.DayOfWeek;
             TimeSpan time = localNow.TimeOfDay;
             TimeSpan startTime = new TimeSpan(9, 0, 0); // 9:00 AM Philippines time
@@ -187,6 +273,25 @@ namespace AppZone
                            (day == DayOfWeek.Sunday && time <= endTime);
 
             return !allowed;
+        }
+
+        private static bool ShouldBlockTradingForLocalTime(DateTimeOffset localNow)
+        {
+            DayOfWeek day = localNow.DayOfWeek;
+            TimeSpan time = localNow.TimeOfDay;
+            TimeSpan weekdayStart = new TimeSpan(6, 55, 0); // 6:55 AM Philippines time
+            TimeSpan weekdayEnd = new TimeSpan(10, 15, 0); // 10:15 AM Philippines time
+
+            bool weekdayWindow = day >= DayOfWeek.Monday &&
+                                 day <= DayOfWeek.Friday &&
+                                 time >= weekdayStart &&
+                                 time <= weekdayEnd;
+
+            bool weekendWindow = (day == DayOfWeek.Saturday && time >= weekdayStart) ||
+                                 (day == DayOfWeek.Sunday) ||
+                                 (day == DayOfWeek.Monday && time <= weekdayStart);
+
+            return !(weekdayWindow || weekendWindow);
         }
 
         private static string NormalizeProcessName(string name)
@@ -206,43 +311,11 @@ namespace AppZone
         {
             try
             {
-                WriteEventLogError($"{message}{Environment.NewLine}{ex}");
+                AuditLog.Error(message, ex);
             }
             catch (Exception)
             {
                 // Best-effort logging only.
-            }
-        }
-
-        private static void WriteEventLogError(string message)
-        {
-            try
-            {
-                if (!EventLog.SourceExists(EventSourceName))
-                {
-                    try
-                    {
-                        EventLog.CreateEventSource(EventSourceName, EventLogName);
-                    }
-                    catch (Exception)
-                    {
-                        // If we cannot create the source, fall back to Trace.
-                        Trace.WriteLine($"{DateTimeOffset.UtcNow:o} {message}");
-                        return;
-                    }
-                }
-
-                string entry = message;
-                if (entry.Length > 32000)
-                {
-                    entry = entry.Substring(0, 32000);
-                }
-
-                EventLog.WriteEntry(EventSourceName, entry, EventLogEntryType.Error);
-            }
-            catch (Exception)
-            {
-                Trace.WriteLine($"{DateTimeOffset.UtcNow:o} {message}");
             }
         }
 
@@ -257,6 +330,193 @@ namespace AppZone
                 // Ignore shutdown race.
             }
         }
+
+        private static void KillProcesses(string[] processNames, Func<Process, string, bool> shouldKill)
+        {
+            foreach (string processName in processNames)
+            {
+                Process[] processes;
+                try
+                {
+                    processes = Process.GetProcessesByName(processName);
+                }
+                catch (Exception ex)
+                {
+                    LogError($"Failed to enumerate processes for {processName}.", ex);
+                    continue;
+                }
+
+                foreach (Process process in processes)
+                {
+                    using (process)
+                    {
+                        if (shouldKill != null)
+                        {
+                            bool allowed = false;
+                            try
+                            {
+                                allowed = shouldKill(process, processName);
+                            }
+                            catch (Exception ex)
+                            {
+                                LogError($"Failed to validate process metadata for {processName}.", ex);
+                            }
+
+                            if (!allowed)
+                            {
+                                continue;
+                            }
+                        }
+
+                        try { process.CloseMainWindow(); } catch (Exception) { }
+                        try { process.Kill(); }
+                        catch (Exception ex)
+                        {
+                            LogKillFailure(processName, process, ex, "Kill threw exception.");
+                            continue;
+                        }
+
+                        try
+                        {
+                            if (!process.HasExited)
+                            {
+                                LogKillFailure(processName, process, null, "Kill did not terminate process.");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogKillFailure(processName, process, ex, "Failed to verify process termination.");
+                        }
+                    }
+                }
+            }
+        }
+
+        private static bool ShouldKillTradingProcess(Process process, string processName)
+        {
+            if (!MetaTraderDescriptionGateProcessNames.Contains(processName))
+            {
+                return true;
+            }
+
+            string description = GetProcessDescription(process);
+            if (string.IsNullOrWhiteSpace(description))
+            {
+                return true;
+            }
+
+            return description.IndexOf("MetaTrader", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static string GetProcessDescription(Process process)
+        {
+            try
+            {
+                if (process == null || process.HasExited)
+                {
+                    return null;
+                }
+
+                ProcessModule module;
+                try
+                {
+                    module = process.MainModule;
+                }
+                catch (Exception)
+                {
+                    return null;
+                }
+
+                return module?.FileVersionInfo?.FileDescription;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static void LogKillFailure(string processName, Process process, Exception ex, string reason)
+        {
+            string pidText = "unknown";
+            try
+            {
+                if (process != null)
+                {
+                    pidText = process.Id.ToString(CultureInfo.InvariantCulture);
+                }
+            }
+            catch (Exception)
+            {
+                // Ignore PID failures.
+            }
+
+            string key = $"{processName}:{pidText}";
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+
+            lock (KillLogLock)
+            {
+                PruneKillFailureLogs(now);
+                if (lastKillFailureLogUtc.TryGetValue(key, out DateTimeOffset last) &&
+                    now - last < KillFailureLogThrottle)
+                {
+                    return;
+                }
+
+                lastKillFailureLogUtc[key] = now;
+            }
+
+            if (ex != null)
+            {
+                AuditLog.Warning($"{reason} Process={processName} PID={pidText}. Exception: {ex.Message}");
+            }
+            else
+            {
+                AuditLog.Warning($"{reason} Process={processName} PID={pidText}.");
+            }
+        }
+
+        private static void PruneKillFailureLogs(DateTimeOffset now)
+        {
+            if (lastKillFailureLogUtc.Count == 0)
+            {
+                return;
+            }
+
+            List<string> toRemove = null;
+            foreach (KeyValuePair<string, DateTimeOffset> entry in lastKillFailureLogUtc)
+            {
+                if (now - entry.Value >= KillFailureLogTtl)
+                {
+                    if (toRemove == null)
+                    {
+                        toRemove = new List<string>();
+                    }
+
+                    toRemove.Add(entry.Key);
+                }
+            }
+
+            if (toRemove != null)
+            {
+                foreach (string key in toRemove)
+                {
+                    lastKillFailureLogUtc.Remove(key);
+                }
+            }
+
+            if (lastKillFailureLogUtc.Count <= KillFailureLogMaxEntries)
+            {
+                return;
+            }
+
+            foreach (KeyValuePair<string, DateTimeOffset> entry in lastKillFailureLogUtc
+                .OrderBy(kvp => kvp.Value)
+                .Take(lastKillFailureLogUtc.Count - KillFailureLogMaxEntries)
+                .ToList())
+            {
+                lastKillFailureLogUtc.Remove(entry.Key);
+            }
+        }
     }
 
     internal static class OnlineTimeProvider
@@ -265,8 +525,17 @@ namespace AppZone
         private static readonly TimeSpan HttpTimeout = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan NtpTimeout = TimeSpan.FromSeconds(2);
         private static readonly TimeSpan MaxAllowedSkew = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan QuorumSkew = TimeSpan.FromMinutes(2);
         private static readonly TimeSpan MinRetryDelay = TimeSpan.FromMinutes(1);
         private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
+        private const int MinimumQuorum = 2;
+        private const int MaxConsecutiveUnreasonable = 3;
+        private static readonly TimeSpan AuditLogThrottle = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan CacheFileMaxAge = TimeSpan.FromHours(24);
+        private static readonly string CacheFilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "AppZone",
+            "time.cache");
 
         private static readonly string[] NtpServers =
         {
@@ -297,9 +566,38 @@ namespace AppZone
         private static TimeSpan currentRetryDelay = TimeSpan.Zero;
         private static DateTimeOffset? lastNetworkUtc;
         private static TimeZoneInfo philippinesTimeZone;
+        private static readonly object AuditLogLock = new object();
+        private static DateTimeOffset? lastNoQuorumLogUtc;
+        private static DateTimeOffset? lastSingleSourceLogUtc;
+        private static DateTimeOffset? lastUnreasonableLogUtc;
+        private static DateTimeOffset? lastResetLogUtc;
+        private static int consecutiveUnreasonableSamples = 0;
+        private static bool cacheLoaded = false;
+
+        private enum TimeSourceKind
+        {
+            Ntp,
+            Http
+        }
+
+        private struct TimeSample
+        {
+            public TimeSample(DateTimeOffset utc, string source, TimeSourceKind kind)
+            {
+                Utc = utc;
+                Source = source;
+                Kind = kind;
+            }
+
+            public DateTimeOffset Utc { get; }
+            public string Source { get; }
+            public TimeSourceKind Kind { get; }
+        }
 
         public static async Task<DateTimeOffset?> GetUtcNowAsync()
         {
+            EnsureCacheLoaded();
+
             if (!NeedsSync() && TryGetCachedUtc(out DateTimeOffset cachedUtc))
             {
                 return cachedUtc;
@@ -334,6 +632,8 @@ namespace AppZone
                 retryStopwatch.Reset();
                 currentRetryDelay = TimeSpan.Zero;
             }
+
+            cacheLoaded = false;
         }
 
         public static DateTimeOffset ConvertUtcToPhilippinesTime(DateTimeOffset utcNow)
@@ -384,30 +684,274 @@ namespace AppZone
                 currentRetryDelay = TimeSpan.Zero;
                 retryStopwatch.Reset();
             }
+
+            TryPersistCache(networkUtc);
         }
 
         private static async Task<DateTimeOffset?> TryFetchNetworkUtcAsync()
         {
-            foreach (string server in NtpServers)
+            List<TimeSample> samples = await CollectTimeSamplesAsync().ConfigureAwait(false);
+            DateTimeOffset? quorumUtc = SelectQuorumTime(samples);
+            if (quorumUtc.HasValue)
             {
-                DateTimeOffset? ntpUtc = await TryGetNtpUtcAsync(server).ConfigureAwait(false);
-                if (ntpUtc.HasValue && IsReasonable(ntpUtc.Value))
+                if (IsReasonable(quorumUtc.Value))
                 {
-                    return ntpUtc.Value;
+                    ResetUnreasonableCounter();
+                    return quorumUtc.Value;
                 }
+
+                RegisterUnreasonableSample(quorumUtc.Value, fromQuorum: true);
             }
 
-            foreach (string endpoint in HttpTimeEndpoints)
+            TimeSample? singleSource = SelectSingleSourceFallback(samples);
+            if (singleSource.HasValue)
             {
-                DateTimeOffset? httpUtc = await TryGetHttpUtcAsync(endpoint).ConfigureAwait(false);
-                if (httpUtc.HasValue && IsReasonable(httpUtc.Value))
+                if (IsReasonable(singleSource.Value.Utc))
                 {
-                    return httpUtc.Value;
+                    ResetUnreasonableCounter();
+                    if (ShouldWriteAuditLog(ref lastSingleSourceLogUtc))
+                    {
+                        AuditLog.Warning($"Time sync quorum failed; using single-source fallback from {singleSource.Value.Source} ({singleSource.Value.Kind}).");
+                    }
+
+                    return singleSource.Value.Utc;
                 }
+
+                RegisterUnreasonableSample(singleSource.Value.Utc, fromQuorum: false);
+            }
+
+            if (samples.Count == 0)
+            {
+                if (ShouldWriteAuditLog(ref lastNoQuorumLogUtc))
+                {
+                    AuditLog.Warning("Time sync failed: no sources reachable.");
+                }
+            }
+            else if (ShouldWriteAuditLog(ref lastNoQuorumLogUtc))
+            {
+                AuditLog.Warning("Time sync failed: no quorum across sources.");
             }
 
             RegisterSyncFailure();
             return null;
+        }
+
+        private static async Task<List<TimeSample>> CollectTimeSamplesAsync()
+        {
+            var tasks = new List<Task<TimeSample?>>();
+
+            foreach (string server in NtpServers)
+            {
+                tasks.Add(TryGetNtpSampleAsync(server));
+            }
+
+            foreach (string endpoint in HttpTimeEndpoints)
+            {
+                tasks.Add(TryGetHttpSampleAsync(endpoint));
+            }
+
+            TimeSample?[] results = await Task.WhenAll(tasks).ConfigureAwait(false);
+            var samples = new List<TimeSample>();
+
+            foreach (TimeSample? sample in results)
+            {
+                if (sample.HasValue)
+                {
+                    samples.Add(sample.Value);
+                }
+            }
+
+            return samples;
+        }
+
+        private static async Task<TimeSample?> TryGetNtpSampleAsync(string server)
+        {
+            DateTimeOffset? utc = await TryGetNtpUtcAsync(server).ConfigureAwait(false);
+            if (utc.HasValue)
+            {
+                return new TimeSample(utc.Value, server, TimeSourceKind.Ntp);
+            }
+
+            return null;
+        }
+
+        private static async Task<TimeSample?> TryGetHttpSampleAsync(string endpoint)
+        {
+            DateTimeOffset? utc = await TryGetHttpUtcAsync(endpoint).ConfigureAwait(false);
+            if (utc.HasValue)
+            {
+                return new TimeSample(utc.Value, endpoint, TimeSourceKind.Http);
+            }
+
+            return null;
+        }
+
+        private static DateTimeOffset? SelectQuorumTime(List<TimeSample> samples)
+        {
+            if (samples == null || samples.Count < MinimumQuorum)
+            {
+                return null;
+            }
+
+            List<TimeSample> ordered = samples
+                .OrderBy(sample => sample.Utc.UtcTicks)
+                .ToList();
+
+            DateTimeOffset median = ordered[ordered.Count / 2].Utc;
+            List<TimeSample> cluster = ordered
+                .Where(sample => (sample.Utc - median).Duration() <= QuorumSkew)
+                .ToList();
+
+            if (cluster.Count < MinimumQuorum)
+            {
+                return null;
+            }
+
+            cluster = cluster.OrderBy(sample => sample.Utc.UtcTicks).ToList();
+            return cluster[cluster.Count / 2].Utc;
+        }
+
+        private static TimeSample? SelectSingleSourceFallback(List<TimeSample> samples)
+        {
+            if (samples == null || samples.Count == 0)
+            {
+                return null;
+            }
+
+            if (!TryGetExpectedUtc(out DateTimeOffset expectedUtc))
+            {
+                return null;
+            }
+
+            TimeSample best = samples
+                .OrderBy(sample => (sample.Utc - expectedUtc).Duration())
+                .First();
+
+            return best;
+        }
+
+        private static bool TryGetExpectedUtc(out DateTimeOffset expectedUtc)
+        {
+            lock (CacheLock)
+            {
+                if (!lastNetworkUtc.HasValue)
+                {
+                    expectedUtc = default;
+                    return false;
+                }
+
+                expectedUtc = lastNetworkUtc.Value + syncStopwatch.Elapsed;
+                return true;
+            }
+        }
+
+        private static bool ShouldWriteAuditLog(ref DateTimeOffset? lastLogUtc)
+        {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            lock (AuditLogLock)
+            {
+                if (!lastLogUtc.HasValue || now - lastLogUtc.Value >= AuditLogThrottle)
+                {
+                    lastLogUtc = now;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static void EnsureCacheLoaded()
+        {
+            if (cacheLoaded)
+            {
+                return;
+            }
+
+            lock (CacheLock)
+            {
+                if (cacheLoaded)
+                {
+                    return;
+                }
+
+                cacheLoaded = true;
+            }
+
+            TryLoadCache();
+        }
+
+        private static void TryLoadCache()
+        {
+            try
+            {
+                if (!File.Exists(CacheFilePath))
+                {
+                    return;
+                }
+
+                string[] lines = File.ReadAllLines(CacheFilePath);
+                if (lines.Length < 2)
+                {
+                    return;
+                }
+
+                if (!DateTimeOffset.TryParse(
+                    lines[0],
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out DateTimeOffset cachedUtc))
+                {
+                    return;
+                }
+
+                if (!DateTimeOffset.TryParse(
+                    lines[1],
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out DateTimeOffset savedAtUtc))
+                {
+                    return;
+                }
+
+                if (DateTimeOffset.UtcNow - savedAtUtc > CacheFileMaxAge)
+                {
+                    return;
+                }
+
+                UpdateCache(cachedUtc);
+                if (ShouldWriteAuditLog(ref lastSingleSourceLogUtc))
+                {
+                    AuditLog.Warning("Loaded cached network time from disk.");
+                }
+            }
+            catch (Exception ex)
+            {
+                AuditLog.Warning($"Failed to load cached network time: {ex.Message}");
+            }
+        }
+
+        private static void TryPersistCache(DateTimeOffset networkUtc)
+        {
+            try
+            {
+                string directory = Path.GetDirectoryName(CacheFilePath);
+                if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                string[] lines =
+                {
+                    networkUtc.UtcDateTime.ToString("o", CultureInfo.InvariantCulture),
+                    DateTimeOffset.UtcNow.UtcDateTime.ToString("o", CultureInfo.InvariantCulture)
+                };
+
+                File.WriteAllLines(CacheFilePath, lines);
+            }
+            catch (Exception ex)
+            {
+                AuditLog.Warning($"Failed to persist cached network time: {ex.Message}");
+            }
         }
 
         private static void RegisterSyncFailure()
@@ -502,6 +1046,13 @@ namespace AppZone
                     {
                         return utc;
                     }
+
+                    if (response.Headers.Date.HasValue)
+                    {
+                        return response.Headers.Date.Value;
+                    }
+
+                    Trace.WriteLine($"{DateTimeOffset.UtcNow:o} Failed to parse UTC from {endpoint}.");
                 }
             }
             catch (Exception)
@@ -516,32 +1067,59 @@ namespace AppZone
         {
             utc = default;
 
-            string[] patterns =
+            if (string.IsNullOrWhiteSpace(json))
             {
-                "\"utc_datetime\"\\s*:\\s*\"(?<dt>[^\"]+)\"",
-                "\"dateTime\"\\s*:\\s*\"(?<dt>[^\"]+)\""
-            };
+                return false;
+            }
 
-            foreach (string pattern in patterns)
+            try
             {
-                Match match = Regex.Match(json, pattern, RegexOptions.IgnoreCase);
-                if (!match.Success)
+                var serializer = new JavaScriptSerializer();
+                object parsed = serializer.DeserializeObject(json);
+                if (parsed is IDictionary<string, object> dict)
                 {
-                    continue;
-                }
+                    if (TryGetUtcFromDictionary(dict, "utc_datetime", out utc))
+                    {
+                        return true;
+                    }
 
-                string raw = match.Groups["dt"].Value;
-                if (DateTimeOffset.TryParse(
-                    raw,
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
-                    out utc))
-                {
-                    return true;
+                    if (TryGetUtcFromDictionary(dict, "dateTime", out utc))
+                    {
+                        return true;
+                    }
                 }
+            }
+            catch (Exception)
+            {
+                return false;
             }
 
             return false;
+        }
+
+        private static bool TryGetUtcFromDictionary(
+            IDictionary<string, object> dict,
+            string key,
+            out DateTimeOffset utc)
+        {
+            utc = default;
+
+            if (!dict.TryGetValue(key, out object value) || value == null)
+            {
+                return false;
+            }
+
+            string raw = value as string;
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return false;
+            }
+
+            return DateTimeOffset.TryParse(
+                raw,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out utc);
         }
 
         private static bool IsReasonable(DateTimeOffset candidate)
@@ -556,6 +1134,51 @@ namespace AppZone
                 DateTimeOffset expected = lastNetworkUtc.Value + syncStopwatch.Elapsed;
                 TimeSpan delta = (candidate - expected).Duration();
                 return delta <= MaxAllowedSkew;
+            }
+        }
+
+        private static void RegisterUnreasonableSample(DateTimeOffset candidateUtc, bool fromQuorum)
+        {
+            bool shouldReset = false;
+
+            lock (CacheLock)
+            {
+                if (!lastNetworkUtc.HasValue)
+                {
+                    return;
+                }
+
+                consecutiveUnreasonableSamples++;
+                if (fromQuorum && consecutiveUnreasonableSamples >= MaxConsecutiveUnreasonable)
+                {
+                    shouldReset = true;
+                }
+            }
+
+            if (shouldReset)
+            {
+                UpdateCache(candidateUtc);
+                ResetUnreasonableCounter();
+
+                if (ShouldWriteAuditLog(ref lastResetLogUtc))
+                {
+                    AuditLog.Warning("Time sync reset after repeated unreasonable quorum samples.");
+                }
+
+                return;
+            }
+
+            if (ShouldWriteAuditLog(ref lastUnreasonableLogUtc))
+            {
+                AuditLog.Warning("Time sync rejected time due to excessive skew.");
+            }
+        }
+
+        private static void ResetUnreasonableCounter()
+        {
+            lock (CacheLock)
+            {
+                consecutiveUnreasonableSamples = 0;
             }
         }
 
