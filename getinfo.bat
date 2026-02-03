@@ -34,6 +34,12 @@ if not exist "%OUT_PATH%" (
   exit /b 1
 )
 
+powershell -NoProfile -Command "try { $ErrorActionPreference = 'SilentlyContinue'; '' | Out-File -FilePath '%OUT_PATH%' -Append -Encoding utf8; 'Services: (Local Machine)' | Out-File -FilePath '%OUT_PATH%' -Append -Encoding utf8; 'Captured: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Out-File -FilePath '%OUT_PATH%' -Append -Encoding utf8; '' | Out-File -FilePath '%OUT_PATH%' -Append -Encoding utf8; Get-Service | Sort-Object DisplayName | Select-Object @{N='Name';E={$_.Name}}, @{N='DisplayName';E={$_.DisplayName}}, @{N='Status';E={$_.Status}}, @{N='StartType';E={$_.StartType}} | Format-Table -AutoSize | Out-String -Width 300 | Out-File -FilePath '%OUT_PATH%' -Append -Encoding utf8 } catch { exit 1 }" >nul 2>&1
+if !ERRORLEVEL! NEQ 0 (
+  call :fail "Failed to capture services."
+  exit /b 1
+)
+
 powershell -NoProfile -Command "try { Set-Clipboard -Path '%OUT_PATH%'; exit 0 } catch { exit 1 }" >nul 2>&1
 if !ERRORLEVEL! NEQ 0 (
   call :fail "Failed to copy the file to clipboard."
