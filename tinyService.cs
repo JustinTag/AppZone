@@ -155,7 +155,6 @@ namespace AppZone
         protected override void OnStart(string[] args)
         {
             stopping = false;
-            OnlineTimeProvider.ForceResync();
             timer = new Timer(OnTimerElapsed, null, TimerInterval, Timeout.InfiniteTimeSpan);
             ScheduleImmediateTick();
             _ = OnlineTimeProvider.GetUtcNowAsync();
@@ -182,7 +181,6 @@ namespace AppZone
                 case PowerBroadcastStatus.ResumeAutomatic:
                 case PowerBroadcastStatus.ResumeCritical:
                 case PowerBroadcastStatus.ResumeSuspend:
-                    OnlineTimeProvider.ForceResync();
                     ScheduleImmediateTick();
                     _ = OnlineTimeProvider.GetUtcNowAsync();
                     break;
