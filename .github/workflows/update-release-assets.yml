@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 env:
-  RELEASE_TAG: v1.0.0      # change to latest if you want a fixed “latest” tag
+  RELEASE_TAG: latest      # fixed rolling tag used by this workflow
 
 jobs:
   build:
@@ -50,3 +50,4 @@ jobs:
           gh release upload $tag $exe $getinfo $setup --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
