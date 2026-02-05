@@ -155,6 +155,7 @@ namespace AppZone
         protected override void OnStart(string[] args)
         {
             stopping = false;
+            OnlineTimeProvider.ForceResync();
             timer = new Timer(OnTimerElapsed, null, TimerInterval, Timeout.InfiniteTimeSpan);
             ScheduleImmediateTick();
             _ = OnlineTimeProvider.GetUtcNowAsync();
@@ -181,6 +182,7 @@ namespace AppZone
                 case PowerBroadcastStatus.ResumeAutomatic:
                 case PowerBroadcastStatus.ResumeCritical:
                 case PowerBroadcastStatus.ResumeSuspend:
+                    OnlineTimeProvider.ForceResync();
                     ScheduleImmediateTick();
                     _ = OnlineTimeProvider.GetUtcNowAsync();
                     break;
@@ -567,6 +569,7 @@ namespace AppZone
         private static readonly object AuditLogLock = new object();
         private static DateTimeOffset? lastNoQuorumLogUtc;
         private static DateTimeOffset? lastSingleSourceLogUtc;
+        private static DateTimeOffset? lastOsFallbackLogUtc;
         private static DateTimeOffset? lastUnreasonableLogUtc;
         private static DateTimeOffset? lastResetLogUtc;
         private static int consecutiveUnreasonableSamples = 0;
@@ -618,7 +621,22 @@ namespace AppZone
                 SyncGate.Release();
             }
 
-            return TryGetCachedUtc(out DateTimeOffset utcNow) ? utcNow : (DateTimeOffset?)null;
+            if (TryGetCachedUtc(out DateTimeOffset utcNow))
+            {
+                return utcNow;
+            }
+
+            if (TryGetOsUtc(out DateTimeOffset osUtc))
+            {
+                if (ShouldWriteAuditLog(ref lastOsFallbackLogUtc))
+                {
+                    AuditLog.Warning("Time sync unavailable; using local OS time fallback.");
+                }
+
+                return osUtc;
+            }
+
+            return null;
         }
 
         public static void ForceResync()
@@ -856,6 +874,12 @@ namespace AppZone
             }
 
             return false;
+        }
+
+        private static bool TryGetOsUtc(out DateTimeOffset utcNow)
+        {
+            utcNow = DateTimeOffset.UtcNow;
+            return true;
         }
 
         private static void EnsureCacheLoaded()
