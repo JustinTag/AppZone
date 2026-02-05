@@ -1,0 +1,52 @@
+name: Build and Update Release Assets
+
+on:
+  push:
+    branches: ["master"]   # change to main if you use main
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: v1.0.0      # change to latest if you want a fixed “latest” tag
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore NuGet packages (packages.config)
+        run: nuget restore .\AppZone.sln
+
+      - name: Build Release (MSBuild / .NET Framework)
+        run: msbuild .\AppZone.sln /p:Configuration=Release /p:Platform="Any CPU" /p:SignManifests=false /p:GenerateManifests=false
+
+      - name: Ensure release exists (create if missing)
+        shell: pwsh
+        run: |
+          $tag = "${{ env.RELEASE_TAG }}"
+          gh release view $tag 1>$null 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --notes "Auto-updated assets"
+          }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload assets (replace)
+        shell: pwsh
+        run: |
+          $tag = "${{ env.RELEASE_TAG }}"
+
+          $exe = ".\bin\Release\AppZone.exe"
+          $getinfo = ".\getinfo.bat"
+          $setup = ".\setup.bat"
+
+          foreach ($p in @($exe, $getinfo, $setup)) {
+            if (!(Test-Path $p)) { throw "Not found: $p" }
+          }
+
+          gh release upload $tag $exe $getinfo $setup --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

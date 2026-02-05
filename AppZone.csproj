@@ -97,6 +97,7 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
+    <None Include=".github\workflows\update-release-assets.yml" />
     <None Include="App.config" />
     <None Include="AppZone_TemporaryKey.pfx" />
     <None Include="packages.config" />
