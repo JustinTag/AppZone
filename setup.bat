@@ -7,7 +7,7 @@ set "INSTALL_DIR=C:\Program Files\AppZone"
 set "EXE_PATH=%INSTALL_DIR%\AppZone.exe"
 set "TMP_PATH=%INSTALL_DIR%\AppZone.exe.tmp"
 set "BACKUP_PATH=%INSTALL_DIR%\AppZone.exe.bak"
-set "DOWNLOAD_URL=https://github.com/JustinTag/AppZone/releases/download/v1.0.0/AppZone.exe"
+set "DOWNLOAD_URL=https://github.com/JustinTagarda/AppZone/releases/latest/download/AppZone.exe"
 
 net session >nul 2>&1
 if !ERRORLEVEL! NEQ 0 (
