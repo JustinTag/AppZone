@@ -48,12 +48,13 @@ jobs:
           $exe = ".\bin\Release\AppZone.exe"
           $getinfo = ".\getinfo.bat"
           $setup = ".\setup.bat"
+          $remove = ".\remove.bat"
 
-          foreach ($p in @($exe, $getinfo, $setup)) {
+          foreach ($p in @($exe, $getinfo, $setup, $remove)) {
             if (!(Test-Path $p)) { throw "Not found: $p" }
           }
 
-          gh release upload $tag $exe $getinfo $setup --clobber
+          gh release upload $tag $exe $getinfo $setup $remove --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
